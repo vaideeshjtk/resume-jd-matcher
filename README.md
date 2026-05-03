@@ -1,0 +1,2 @@
+# resume-jd-matcher
+AI TALENT INTELLIGENCE PLATFORM
