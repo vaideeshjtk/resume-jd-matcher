@@ -1,0 +1,774 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ResumeMatch AI</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700;800&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body, #root { height: 100%; }
+    body { background: #080D1A; color: #E2E8F4; font-family: 'Syne', sans-serif; }
+    ::-webkit-scrollbar { width: 5px; height: 5px; }
+    ::-webkit-scrollbar-track { background: #0c1425; }
+    ::-webkit-scrollbar-thumb { background: #1e3058; border-radius: 3px; }
+    .dz { transition: all .2s; }
+    .dz.over { border-color: #00C9A7 !important; background: rgba(0,201,167,.07) !important; }
+    .btn-go { transition: all .15s; }
+    .btn-go:hover:not(:disabled) { filter: brightness(1.12); transform: translateY(-1px); }
+    .cell-click:hover { background: rgba(0,201,167,.1) !important; cursor: pointer; }
+    .frow:hover { background: rgba(255,255,255,.02); }
+    .tab-btn { transition: all .15s; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+
+// ─── OpenAI Model ─────────────────────────────────────────────────────────────
+const MODEL = "gpt-4o-mini"; // cheap + fast; change to "gpt-4o" for higher quality
+
+// ─── Library Loaders ──────────────────────────────────────────────────────────
+let pdfReady = false, zipReady = false;
+function loadScript(src) {
+  return new Promise((res, rej) => {
+    if (document.querySelector(`script[src="${src}"]`)) { res(); return; }
+    const s = document.createElement("script");
+    s.src = src; s.onload = res; s.onerror = rej;
+    document.head.appendChild(s);
+  });
+}
+async function ensurePDF() {
+  if (pdfReady) return;
+  await loadScript("https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js");
+  window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+    "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+  pdfReady = true;
+}
+async function ensureZip() {
+  if (zipReady) return;
+  await loadScript("https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js");
+  zipReady = true;
+}
+
+// ─── Text Extraction ──────────────────────────────────────────────────────────
+async function extractText(file) {
+  const ext = file.name.split(".").pop().toLowerCase();
+  if (ext === "txt") {
+    return new Promise((res, rej) => {
+      const r = new FileReader();
+      r.onload = e => res(e.target.result);
+      r.onerror = rej;
+      r.readAsText(file);
+    });
+  }
+  if (ext === "pdf") {
+    await ensurePDF();
+    const buf = await file.arrayBuffer();
+    const pdf = await window.pdfjsLib.getDocument({ data: buf }).promise;
+    let txt = "";
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i);
+      const c = await page.getTextContent();
+      txt += c.items.map(it => it.str).join(" ") + "\n";
+    }
+    return txt;
+  }
+  if (ext === "docx" || ext === "doc") {
+    const buf = await file.arrayBuffer();
+    const result = await mammoth.extractRawText({ arrayBuffer: buf });
+    return result.value;
+  }
+  if (ext === "pptx") {
+    await ensureZip();
+    const buf = await file.arrayBuffer();
+    const zip = await JSZip.loadAsync(buf);
+    let txt = "";
+    const slides = Object.keys(zip.files)
+      .filter(n => /^ppt\/slides\/slide\d+\.xml$/.test(n))
+      .sort((a, b) => parseInt(a.match(/\d+/)[0]) - parseInt(b.match(/\d+/)[0]));
+    for (const s of slides) {
+      const xml = await zip.files[s].async("string");
+      const ms = xml.match(/<a:t[^>]*>([^<]*)<\/a:t>/g) || [];
+      txt += ms.map(m => m.replace(/<[^>]+>/g, "")).join(" ") + "\n";
+    }
+    return txt || "PPTX text extraction limited — consider PDF export";
+  }
+  throw new Error(`Unsupported file type: .${ext}`);
+}
+
+// ─── OpenAI API ───────────────────────────────────────────────────────────────
+async function callOpenAI(apiKey, prompt, maxTokens = 1000) {
+  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: MODEL,
+      max_tokens: maxTokens,
+      response_format: { type: "json_object" }, // forces JSON output
+      messages: [
+        { role: "system", content: "You are a helpful assistant that always responds with valid JSON only. No markdown, no explanation, just raw JSON." },
+        { role: "user", content: prompt }
+      ],
+    }),
+  });
+  if (!res.ok) {
+    const e = await res.json().catch(() => ({}));
+    throw new Error(`OpenAI ${res.status}: ${e?.error?.message || res.statusText}`);
+  }
+  const data = await res.json();
+  const txt = data.choices?.[0]?.message?.content || "";
+  try { return JSON.parse(txt); }
+  catch {
+    const m = txt.match(/(\{[\s\S]*\}|\[[\s\S]*\])/);
+    if (m) return JSON.parse(m[0]);
+    throw new Error("Could not parse JSON: " + txt.substring(0, 200));
+  }
+}
+
+async function analyzeResume(apiKey, text) {
+  return callOpenAI(apiKey,
+    `Analyze this resume and return a JSON object.\n\nResume:\n${text.substring(0, 5000)}\n\n` +
+    `Return exactly: {"name":"full name","title":"job title","experience_years":0,"skills":["skill1"],"education":"degree and field","certifications":["cert1"],"industries":["industry1"],"summary":"2-3 sentence professional summary"}`,
+    1000);
+}
+
+async function analyzeJD(apiKey, text) {
+  return callOpenAI(apiKey,
+    `Analyze this job description and return a JSON object.\n\nJD:\n${text.substring(0, 5000)}\n\n` +
+    `Return exactly: {"title":"job title","required_skills":["skill1"],"preferred_skills":["skill1"],"experience_required":0,"education_required":"degree","certifications_preferred":["cert1"],"industry":"industry name","summary":"2-3 sentence role summary"}`,
+    800);
+}
+
+async function matchResumeToAllJDs(apiKey, resumeAnalysis, jdAnalyses) {
+  // OpenAI json_object mode requires a single top-level object, so we wrap the array
+  const result = await callOpenAI(apiKey,
+    `You are a senior recruiter. Evaluate this candidate against ${jdAnalyses.length} job description(s).\n\n` +
+    `CANDIDATE: ${JSON.stringify(resumeAnalysis)}\n\nJOB DESCRIPTIONS: ${JSON.stringify(jdAnalyses.map((j,i)=>({index:i,...j})))}\n\n` +
+    `Return a JSON object with a single key "matches" containing an array of ${jdAnalyses.length} objects (one per JD in order):\n` +
+    `{"matches":[{"jd_index":0,"overall_score":85,"skills_score":80,"experience_score":90,"education_score":85,` +
+    `"verdict":"Strong Match","matching_skills":["skill1"],"missing_required_skills":["skill2"],"missing_preferred_skills":["skill3"],` +
+    `"strengths":["strength 1","strength 2","strength 3"],` +
+    `"gap_analysis":[{"gap":"description","importance":"Critical"}],` +
+    `"course_suggestions":[{"skill":"skill name","course":"exact course title","platform":"Coursera","duration":"20 hours","priority":"High"}],` +
+    `"recommendation":"2-3 sentence personalized recommendation"}]}`,
+    3000);
+  // Unwrap the array from the wrapper object
+  return result?.matches || result;
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+const scoreCol = s => s >= 80 ? "#22C55E" : s >= 65 ? "#00C9A7" : s >= 50 ? "#F59E0B" : s >= 35 ? "#F97316" : "#EF4444";
+const verdictCol = { "Strong Match": "#22C55E", "Good Match": "#00C9A7", "Potential Match": "#F59E0B", "Needs Development": "#EF4444" };
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// ─── Icons ────────────────────────────────────────────────────────────────────
+const Icon = {
+  Zap: () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>,
+  File: ({ size=14, color="currentColor" }) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>,
+  Brief: ({ size=14 }) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="7" width="20" height="14" rx="2" ry="2"/><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/></svg>,
+  X: ({ size=14 }) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>,
+  Download: ({ size=13 }) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>,
+  Refresh: ({ size=13 }) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>,
+  Target: ({ size=15 }) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>,
+  Book: ({ size=11 }) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>,
+  Clock: ({ size=11 }) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>,
+  Check: ({ size=28 }) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>,
+  Award: ({ size=28 }) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="8" r="6"/><path d="M15.477 12.89L17 22l-5-3-5 3 1.523-9.11"/></svg>,
+  Arrow: () => <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>,
+  Key: () => <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>,
+  Eye: ({ show }) => show
+    ? <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+    : <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>,
+  OpenAI: () => <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><path d="M22.282 9.821a5.985 5.985 0 0 0-.516-4.91 6.046 6.046 0 0 0-6.51-2.9A6.065 6.065 0 0 0 4.981 4.18a5.985 5.985 0 0 0-3.998 2.9 6.046 6.046 0 0 0 .743 7.097 5.98 5.98 0 0 0 .51 4.911 6.051 6.051 0 0 0 6.515 2.9A5.985 5.985 0 0 0 13.26 24a6.056 6.056 0 0 0 5.772-4.206 5.99 5.99 0 0 0 3.997-2.9 6.056 6.056 0 0 0-.747-7.073zM13.26 22.43a4.476 4.476 0 0 1-2.876-1.04l.141-.081 4.779-2.758a.795.795 0 0 0 .392-.681v-6.737l2.02 1.168a.071.071 0 0 1 .038.052v5.583a4.504 4.504 0 0 1-4.494 4.494zM3.6 18.304a4.47 4.47 0 0 1-.535-3.014l.142.085 4.783 2.759a.771.771 0 0 0 .78 0l5.843-3.369v2.332a.08.08 0 0 1-.032.067L9.856 19.83a4.49 4.49 0 0 1-6.256-1.526zM2.34 7.896a4.485 4.485 0 0 1 2.366-1.973V11.6a.766.766 0 0 0 .388.676l5.815 3.355-2.02 1.168a.076.076 0 0 1-.071 0l-4.83-2.786A4.504 4.504 0 0 1 2.34 7.896zm16.597 3.855l-5.843-3.372 2.02-1.164a.08.08 0 0 1 .071 0l4.83 2.786a4.494 4.494 0 0 1-.676 8.105v-5.677a.79.79 0 0 0-.402-.678zm2.010-3.023l-.141-.085-4.774-2.782a.776.776 0 0 0-.785 0L9.409 9.23V6.897a.066.066 0 0 1 .028-.061l4.83-2.787a4.5 4.5 0 0 1 6.68 4.66zm-12.64 4.135l-2.02-1.164a.08.08 0 0 1-.038-.057V6.075a4.5 4.5 0 0 1 7.375-3.453l-.142.08L8.704 5.46a.795.795 0 0 0-.393.681zm1.097-2.365l2.602-1.5 2.607 1.5v2.999l-2.597 1.5-2.607-1.5z"/></svg>,
+};
+
+// ─── API Key Screen ───────────────────────────────────────────────────────────
+function ApiKeyScreen({ onSubmit }) {
+  const [key, setKey] = useState("");
+  const [show, setShow] = useState(false);
+  const [err, setErr] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  const handleSubmit = async () => {
+    const k = key.trim();
+    if (!k.startsWith("sk-")) { setErr("OpenAI keys start with sk-"); return; }
+    setLoading(true); setErr("");
+    try {
+      // Quick validation ping with cheapest model
+      const res = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${k}` },
+        body: JSON.stringify({ model: "gpt-4o-mini", max_tokens: 5, messages: [{ role: "user", content: "hi" }] }),
+      });
+      if (res.status === 401) { setErr("Invalid API key — check and try again."); setLoading(false); return; }
+      if (res.status === 429) { setErr("Rate limit or quota exceeded on your OpenAI account."); setLoading(false); return; }
+      onSubmit(k);
+    } catch(e) { setErr("Network error: " + e.message); setLoading(false); }
+  };
+
+  return (
+    <div style={{ minHeight:"100vh", display:"flex", alignItems:"center", justifyContent:"center", padding:24 }}>
+      <div style={{ maxWidth:460, width:"100%" }}>
+        <div style={{ textAlign:"center", marginBottom:40 }}>
+          <div style={{ display:"inline-flex", alignItems:"center", gap:7, background:"rgba(0,201,167,.1)", border:"1px solid rgba(0,201,167,.25)", borderRadius:100, padding:"5px 16px", marginBottom:20 }}>
+            <span style={{color:"#00C9A7"}}><Icon.Zap /></span>
+            <span style={{ fontSize:11, color:"#00C9A7", letterSpacing:".12em", fontFamily:"'DM Mono'" }}>AI TALENT INTELLIGENCE PLATFORM</span>
+          </div>
+          <h1 style={{ fontSize:42, fontWeight:800, letterSpacing:"-.03em", lineHeight:1.05, marginBottom:12 }}>
+            Resume<span style={{color:"#00C9A7"}}>Match</span> AI
+          </h1>
+          <p style={{ fontSize:14, color:"#7B90BB", lineHeight:1.75 }}>
+            Upload CVs and job descriptions — AI scores every match,<br/>maps skill gaps, and builds personalized training roadmaps.
+          </p>
+        </div>
+
+        <div style={{ background:"#0C1425", border:"1px solid #1A2D50", borderRadius:16, padding:"28px 28px 24px" }}>
+          <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:6 }}>
+            <span style={{color:"#E2E8F4"}}><Icon.OpenAI /></span>
+            <span style={{ fontWeight:700, fontSize:15 }}>Enter your OpenAI API key</span>
+          </div>
+          <div style={{ display:"inline-flex", alignItems:"center", gap:6, background:"rgba(16,185,129,.08)", border:"1px solid rgba(16,185,129,.2)", borderRadius:6, padding:"3px 10px", marginBottom:16 }}>
+            <span style={{ fontSize:10, fontFamily:"'DM Mono'", color:"#10B981" }}>Powered by {MODEL}</span>
+          </div>
+          <p style={{ fontSize:12, color:"#7B90BB", lineHeight:1.75, marginBottom:16 }}>
+            Your key runs entirely in your browser —&nbsp;
+            <strong style={{color:"#E2E8F4"}}>never stored or sent anywhere</strong>.
+            Get one at{" "}
+            <a href="https://platform.openai.com/api-keys" target="_blank" rel="noreferrer" style={{color:"#00C9A7"}}>platform.openai.com/api-keys</a>.
+          </p>
+          <div style={{ position:"relative", marginBottom: err ? 10 : 18 }}>
+            <input
+              type={show ? "text" : "password"}
+              value={key}
+              onChange={e => { setKey(e.target.value); setErr(""); }}
+              onKeyDown={e => e.key === "Enter" && handleSubmit()}
+              placeholder="sk-..."
+              style={{ width:"100%", background:"#060C1A", border:"1px solid #1A2D50", borderRadius:10, padding:"12px 40px 12px 14px", fontSize:13, color:"#E2E8F4", fontFamily:"'DM Mono'", outline:"none" }}
+            />
+            <button onClick={() => setShow(v => !v)} style={{ position:"absolute", right:12, top:"50%", transform:"translateY(-50%)", background:"none", border:"none", cursor:"pointer", color:"#3D5280", display:"flex" }}>
+              <Icon.Eye show={show} />
+            </button>
+          </div>
+          {err && <div style={{ fontSize:12, color:"#EF4444", marginBottom:14 }}>{err}</div>}
+          <button className="btn-go" onClick={handleSubmit} disabled={!key.trim() || loading}
+            style={{ width:"100%", background: key.trim()&&!loading ? "linear-gradient(135deg,#00C9A7,#0088FF)" : "#1A2D50", color: key.trim()&&!loading ? "#050B18" : "#3D5280", border:"none", borderRadius:10, padding:"13px", fontSize:14, fontWeight:700, fontFamily:"'Syne'", cursor: key.trim()&&!loading ? "pointer" : "not-allowed", display:"flex", alignItems:"center", justifyContent:"center", gap:8 }}>
+            {loading ? "Verifying…" : <><Icon.Arrow /> Start matching</>}
+          </button>
+        </div>
+        <p style={{ textAlign:"center", fontSize:11, color:"#3D5280", marginTop:14 }}>
+          Supports PDF · DOCX · PPTX · TXT &nbsp;·&nbsp; Uses {MODEL} (~$0.01–0.05 per analysis)
+        </p>
+      </div>
+    </div>
+  );
+}
+
+// ─── Upload Step ──────────────────────────────────────────────────────────────
+function UploadStep({ rFiles, setRFiles, jFiles, setJFiles, onStart, onBack }) {
+  const rRef = useRef(), jRef = useRef();
+  const makeDrop = setter => ({
+    onDragOver: e => { e.preventDefault(); e.currentTarget.classList.add("over"); },
+    onDragLeave: e => e.currentTarget.classList.remove("over"),
+    onDrop: e => { e.preventDefault(); e.currentTarget.classList.remove("over"); setter(prev => [...prev, ...Array.from(e.dataTransfer.files)]); },
+  });
+  const canStart = rFiles.length > 0 && jFiles.length > 0;
+  return (
+    <div style={{ maxWidth:900, margin:"0 auto", padding:"56px 24px" }}>
+      <div style={{ textAlign:"center", marginBottom:48 }}>
+        <div style={{ display:"inline-flex", alignItems:"center", gap:7, background:"rgba(0,201,167,.1)", border:"1px solid rgba(0,201,167,.25)", borderRadius:100, padding:"5px 16px", marginBottom:20 }}>
+          <span style={{color:"#00C9A7"}}><Icon.Zap /></span>
+          <span style={{ fontSize:11, color:"#00C9A7", letterSpacing:".12em", fontFamily:"'DM Mono'" }}>AI TALENT INTELLIGENCE PLATFORM</span>
+        </div>
+        <h1 style={{ fontSize:44, fontWeight:800, letterSpacing:"-.03em", lineHeight:1.05, marginBottom:14 }}>
+          Resume<span style={{color:"#00C9A7"}}>Match</span> AI
+        </h1>
+        <p style={{ fontSize:14, color:"#7B90BB", maxWidth:460, margin:"0 auto", lineHeight:1.75 }}>
+          Upload CVs and job descriptions. AI scores every match, maps skill gaps, and builds a personalized training roadmap.
+        </p>
+      </div>
+
+      <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:20, marginBottom:32 }}>
+        {[
+          { label:"Resumes / CVs", color:"#00C9A7", rgb:"0,201,167", files:rFiles, setter:setRFiles, ref:rRef, accept:".pdf,.doc,.docx,.pptx,.txt", hint:"PDF · DOCX · PPTX · TXT", icon:<Icon.File size={26} color="#00C9A7"/> },
+          { label:"Job Descriptions", color:"#F59E0B", rgb:"245,158,11", files:jFiles, setter:setJFiles, ref:jRef, accept:".pdf,.doc,.docx,.txt", hint:"PDF · DOCX · TXT", icon:<span style={{color:"#F59E0B"}}><Icon.Brief size={26}/></span> },
+        ].map(({ label, color, rgb, files, setter, ref, accept, hint, icon }) => (
+          <div key={label}>
+            <div className="dz" {...makeDrop(setter)} onClick={() => ref.current.click()}
+              style={{ border:`2px dashed rgba(${rgb},.28)`, borderRadius:14, padding:"36px 20px", textAlign:"center", cursor:"pointer", background:"#0C1425" }}>
+              <div style={{ marginBottom:12, display:"flex", justifyContent:"center" }}>{icon}</div>
+              <div style={{ fontWeight:700, fontSize:15, marginBottom:6 }}>{label}</div>
+              <div style={{ fontSize:12, color:"#7B90BB" }}>Drag & drop or <span style={{color}}>browse</span></div>
+              <div style={{ fontSize:10, color:"#3D5280", marginTop:8, fontFamily:"'DM Mono'" }}>{hint}</div>
+              <input ref={ref} type="file" multiple accept={accept} style={{display:"none"}} onChange={e => setter(prev => [...prev, ...Array.from(e.target.files)])} />
+            </div>
+            {files.length > 0 && (
+              <div style={{ marginTop:10, background:"#0C1425", border:"1px solid #1A2D50", borderRadius:10, overflow:"hidden" }}>
+                {files.map((f, i) => (
+                  <div key={i} className="frow" style={{ display:"flex", alignItems:"center", gap:10, padding:"8px 12px", borderBottom: i<files.length-1?"1px solid #1A2D50":"none" }}>
+                    <Icon.File size={11} color={color} />
+                    <span style={{ flex:1, fontSize:11, color:"#B0BFDA", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{f.name}</span>
+                    <span style={{ fontSize:10, color:"#3D5280", fontFamily:"'DM Mono'" }}>{(f.size/1024).toFixed(0)}KB</span>
+                    <button onClick={e => { e.stopPropagation(); setter(prev => prev.filter((_,j)=>j!==i)); }}
+                      style={{ background:"none", border:"none", cursor:"pointer", color:"#3D5280", display:"flex", padding:2 }}><Icon.X size={11}/></button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+
+      <div style={{ textAlign:"center" }}>
+        <button className="btn-go" disabled={!canStart} onClick={canStart ? onStart : undefined}
+          style={{ background: canStart?"linear-gradient(135deg,#00C9A7,#0088FF)":"#1A2D50", color: canStart?"#050B18":"#3D5280", border:"none", borderRadius:12, padding:"15px 48px", fontSize:14, fontWeight:700, fontFamily:"'Syne'", cursor: canStart?"pointer":"not-allowed", display:"inline-flex", alignItems:"center", gap:10 }}>
+          <span style={{color: canStart?"#050B18":"#3D5280"}}><Icon.Zap /></span>
+          {canStart ? `Analyze ${rFiles.length} resume${rFiles.length>1?"s":""} × ${jFiles.length} JD${jFiles.length>1?"s":""}` : "Upload files to continue"}
+          {canStart && <Icon.Arrow />}
+        </button>
+        <div style={{marginTop:12}}>
+          <button onClick={onBack} style={{ background:"none", border:"none", color:"#3D5280", fontSize:12, cursor:"pointer", fontFamily:"'Syne'" }}>← Change API key</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Processing Step ──────────────────────────────────────────────────────────
+function ProcessingStep({ log, progress, status }) {
+  const ref = useRef();
+  useEffect(() => { if (ref.current) ref.current.scrollTop = ref.current.scrollHeight; }, [log]);
+  const C = 2 * Math.PI * 34;
+  return (
+    <div style={{ maxWidth:640, margin:"0 auto", padding:"60px 24px" }}>
+      <div style={{ textAlign:"center", marginBottom:40 }}>
+        <div style={{ position:"relative", width:88, height:88, margin:"0 auto 20px" }}>
+          <svg width="88" height="88" viewBox="0 0 88 88">
+            <circle cx="44" cy="44" r="34" fill="none" stroke="#1A2D50" strokeWidth="6"/>
+            <circle cx="44" cy="44" r="34" fill="none" stroke="#00C9A7" strokeWidth="6" strokeLinecap="round"
+              strokeDasharray={`${C*progress/100} ${C*(1-progress/100)}`} strokeDashoffset={C*0.25}
+              style={{transition:"stroke-dasharray .4s ease"}}/>
+          </svg>
+          <div style={{ position:"absolute", inset:0, display:"flex", alignItems:"center", justifyContent:"center" }}>
+            <span style={{ fontFamily:"'DM Mono'", fontSize:15, fontWeight:500, color:"#00C9A7" }}>{progress}%</span>
+          </div>
+        </div>
+        <h2 style={{ fontSize:24, fontWeight:700, marginBottom:8 }}>Processing files…</h2>
+        <p style={{ fontSize:13, color:"#7B90BB" }}>{status || "Initializing…"}</p>
+      </div>
+      <div ref={ref} style={{ background:"#0C1425", border:"1px solid #1A2D50", borderRadius:12, padding:"14px 16px", height:320, overflowY:"auto" }}>
+        {log.length===0 && <span style={{color:"#3D5280",fontSize:12}}>Waiting…</span>}
+        {log.map((e,i) => (
+          <div key={i} style={{ display:"flex", gap:12, marginBottom:5, fontSize:12, lineHeight:1.55 }}>
+            <span style={{ color:"#3D5280", fontFamily:"'DM Mono'", fontSize:10, flexShrink:0, marginTop:1 }}>{e.t}</span>
+            <span style={{ color: e.type==="err"?"#EF4444":e.type==="ok"?"#22C55E":e.type==="section"?"#00C9A7":"#B0BFDA", fontWeight: e.type==="section"?600:400 }}>{e.msg}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── Dashboard ────────────────────────────────────────────────────────────────
+function Dashboard({ result, selected, setSelected, onExport, onReset }) {
+  const { resumes, jds, matches } = result;
+  const allScores = Object.values(matches).flat().map(m => m.overall_score).filter(Boolean);
+  const avgScore = allScores.length ? Math.round(allScores.reduce((a,b)=>a+b,0)/allScores.length) : 0;
+  const strongCount = Object.values(matches).flat().filter(m => ["Strong Match","Good Match"].includes(m.verdict)).length;
+  const selM = selected ? (matches[selected.ri]||[]).find(m=>m.jd_index===selected.ji) : null;
+  const selR = selected ? resumes[selected.ri] : null;
+  const selJ = selected ? jds[selected.ji] : null;
+
+  return (
+    <div style={{ display:"flex", flexDirection:"column", height:"100vh" }}>
+      <div style={{ background:"#0C1425", borderBottom:"1px solid #1A2D50", padding:"10px 18px", display:"flex", alignItems:"center", gap:10, flexShrink:0, flexWrap:"wrap" }}>
+        <span style={{ fontWeight:800, fontSize:16, letterSpacing:"-.02em", marginRight:4 }}>
+          Resume<span style={{color:"#00C9A7"}}>Match</span> AI
+        </span>
+        {[
+          {v:resumes.length,l:"candidates",c:"#00C9A7"},
+          {v:jds.length,l:"job roles",c:"#F59E0B"},
+          {v:`${avgScore}%`,l:"avg match",c:"#C084FC"},
+          {v:strongCount,l:"strong+ matches",c:"#22C55E"},
+        ].map(({v,l,c}) => (
+          <div key={l} style={{ background:"#162040", borderRadius:7, padding:"4px 10px", display:"flex", gap:6, alignItems:"baseline" }}>
+            <span style={{ fontFamily:"'DM Mono'", fontWeight:500, fontSize:13, color:c }}>{v}</span>
+            <span style={{ fontSize:10, color:"#3D5280" }}>{l}</span>
+          </div>
+        ))}
+        <div style={{flex:1}}/>
+        <button onClick={onExport} style={{ background:"#1A2D50", border:"none", color:"#B0BFDA", borderRadius:7, padding:"6px 12px", cursor:"pointer", display:"flex", alignItems:"center", gap:5, fontSize:11, fontFamily:"'Syne'", fontWeight:600 }}>
+          <Icon.Download /> CSV
+        </button>
+        <button onClick={onReset} style={{ background:"transparent", border:"1px solid #1A2D50", color:"#7B90BB", borderRadius:7, padding:"6px 12px", cursor:"pointer", display:"flex", alignItems:"center", gap:5, fontSize:11, fontFamily:"'Syne'" }}>
+          <Icon.Refresh /> New
+        </button>
+      </div>
+
+      <div style={{ display:"flex", flex:1, overflow:"hidden" }}>
+        <div style={{ flex:1, overflow:"auto", padding:18 }}>
+          <div style={{ background:"#0C1425", borderRadius:14, border:"1px solid #1A2D50", overflow:"auto", marginBottom:14 }}>
+            <div style={{ padding:"12px 16px", borderBottom:"1px solid #1A2D50", display:"flex", alignItems:"center", gap:8 }}>
+              <span style={{color:"#00C9A7"}}><Icon.Target /></span>
+              <span style={{ fontWeight:700, fontSize:13 }}>Match matrix</span>
+              <span style={{ fontSize:11, color:"#3D5280" }}>— click any cell for full analysis</span>
+            </div>
+            <table style={{ width:"100%", borderCollapse:"collapse" }}>
+              <thead>
+                <tr style={{background:"#0F1E3A"}}>
+                  <th style={{ textAlign:"left", padding:"10px 14px", fontSize:10, color:"#7B90BB", fontWeight:600, minWidth:190, borderRight:"1px solid #1A2D50", letterSpacing:".08em" }}>CANDIDATE</th>
+                  {jds.map((jd,ji) => (
+                    <th key={ji} style={{ textAlign:"center", padding:"10px 8px", fontSize:10, color:"#F59E0B", fontWeight:700, borderRight:ji<jds.length-1?"1px solid #1A2D50":"none", minWidth:130, letterSpacing:".06em" }}>
+                      <div style={{ maxWidth:120, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", margin:"0 auto" }} title={jd.analysis.title}>{jd.analysis.title||jd.file.name}</div>
+                    </th>
+                  ))}
+                  <th style={{ textAlign:"center", padding:"10px 8px", fontSize:10, color:"#7B90BB", fontWeight:700, minWidth:100, letterSpacing:".06em" }}>BEST MATCH</th>
+                </tr>
+              </thead>
+              <tbody>
+                {resumes.map((r,ri) => {
+                  const rm = matches[ri]||[];
+                  const bestScore = rm.length ? Math.max(...rm.map(m=>m.overall_score)) : 0;
+                  const bestM = rm.find(m=>m.overall_score===bestScore);
+                  return (
+                    <tr key={ri} style={{borderBottom:"1px solid #1A2D50"}}>
+                      <td style={{ padding:"11px 14px", borderRight:"1px solid #1A2D50" }}>
+                        <div style={{ fontWeight:600, fontSize:13, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", maxWidth:175 }}>{r.analysis.name}</div>
+                        <div style={{ fontSize:11, color:"#7B90BB", marginTop:2, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", maxWidth:175 }}>
+                          {r.analysis.title}{r.analysis.experience_years>0?` · ${r.analysis.experience_years}y exp`:""}
+                        </div>
+                      </td>
+                      {jds.map((_,ji) => {
+                        const m = rm.find(m=>m.jd_index===ji);
+                        const s = m?.overall_score||0;
+                        const isSel = selected?.ri===ri && selected?.ji===ji;
+                        return (
+                          <td key={ji} className="cell-click" onClick={() => setSelected({ri,ji})}
+                            style={{ textAlign:"center", padding:"9px 5px", borderRight:ji<jds.length-1?"1px solid #1A2D50":"none", background:isSel?"rgba(0,201,167,.13)":"transparent", outline:isSel?"2px solid #00C9A7":"none", outlineOffset:-2 }}>
+                            {m ? (
+                              <div style={{ display:"flex", flexDirection:"column", alignItems:"center", gap:3 }}>
+                                <span style={{ fontFamily:"'DM Mono'", fontSize:20, fontWeight:500, color:scoreCol(s), lineHeight:1 }}>{s}</span>
+                                <span style={{ fontSize:9, fontWeight:700, padding:"2px 5px", borderRadius:4, background:`${verdictCol[m.verdict]||"#7B90BB"}18`, color:verdictCol[m.verdict]||"#7B90BB", letterSpacing:".04em", whiteSpace:"nowrap" }}>
+                                  {m.verdict?.toUpperCase()}
+                                </span>
+                              </div>
+                            ) : <span style={{color:"#3D5280"}}>—</span>}
+                          </td>
+                        );
+                      })}
+                      <td style={{ textAlign:"center", padding:"9px 6px" }}>
+                        <div style={{ display:"flex", flexDirection:"column", alignItems:"center", gap:2 }}>
+                          <span style={{ fontFamily:"'DM Mono'", fontSize:22, fontWeight:600, color:scoreCol(bestScore), lineHeight:1 }}>{bestScore}%</span>
+                          {bestM && <span style={{ fontSize:10, color:"#7B90BB", maxWidth:85, textAlign:"center", lineHeight:1.3 }}>{jds[bestM.jd_index]?.analysis?.title}</span>}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <div style={{ display:"flex", gap:16, flexWrap:"wrap", paddingLeft:2 }}>
+            {[["80–100","#22C55E","Strong"],["65–79","#00C9A7","Good"],["50–64","#F59E0B","Potential"],["35–49","#F97316","Developing"],["0–34","#EF4444","Needs work"]].map(([r,c,l]) => (
+              <div key={r} style={{ display:"flex", alignItems:"center", gap:5, fontSize:11, color:"#7B90BB" }}>
+                <div style={{ width:7, height:7, borderRadius:2, background:c, flexShrink:0 }}/>
+                <span style={{ fontFamily:"'DM Mono'", color:c }}>{r}</span>
+                <span>{l}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {selM && selR && selJ && (
+          <div style={{ width:360, borderLeft:"1px solid #1A2D50", overflow:"auto", background:"#090E1C", flexShrink:0 }}>
+            <DetailPanel match={selM} resume={selR} jd={selJ} onClose={() => setSelected(null)} />
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Detail Panel ─────────────────────────────────────────────────────────────
+function DetailPanel({ match, resume, jd, onClose }) {
+  const [tab, setTab] = useState("overview");
+  return (
+    <div style={{padding:16}}>
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:12 }}>
+        <div style={{flex:1,minWidth:0}}>
+          <div style={{ fontSize:9, color:"#3D5280", letterSpacing:".1em", marginBottom:3, fontFamily:"'DM Mono'" }}>CANDIDATE</div>
+          <div style={{ fontWeight:700, fontSize:14, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{resume.analysis.name}</div>
+          <div style={{ fontSize:11, color:"#7B90BB", marginTop:2 }}>{resume.analysis.title}</div>
+        </div>
+        <button onClick={onClose} style={{ background:"none", border:"none", cursor:"pointer", color:"#3D5280", padding:4, flexShrink:0 }}><Icon.X size={14}/></button>
+      </div>
+      <div style={{ background:"#0F1E3A", borderRadius:9, padding:"8px 11px", marginBottom:12, border:"1px solid #1A2D50" }}>
+        <div style={{ fontSize:9, color:"#F59E0B", letterSpacing:".1em", marginBottom:2, fontFamily:"'DM Mono'" }}>ROLE</div>
+        <div style={{ fontWeight:600, fontSize:13 }}>{jd.analysis.title}</div>
+        {jd.analysis.industry && <div style={{ fontSize:11, color:"#7B90BB", marginTop:1 }}>{jd.analysis.industry}</div>}
+      </div>
+      <div style={{ background:"#0C1425", borderRadius:12, padding:"16px 14px", marginBottom:12, textAlign:"center", border:`1px solid ${scoreCol(match.overall_score)}30` }}>
+        <div style={{ fontFamily:"'DM Mono'", fontSize:52, fontWeight:500, color:scoreCol(match.overall_score), lineHeight:1 }}>{match.overall_score}</div>
+        <div style={{ fontSize:9, color:"#3D5280", letterSpacing:".12em", marginTop:3 }}>OVERALL MATCH SCORE</div>
+        <div style={{ marginTop:8, display:"inline-block", background:`${verdictCol[match.verdict]||"#7B90BB"}20`, color:verdictCol[match.verdict]||"#7B90BB", borderRadius:20, padding:"3px 13px", fontSize:11, fontWeight:700 }}>{match.verdict}</div>
+        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:6, marginTop:12 }}>
+          {[["Skills",match.skills_score],["Experience",match.experience_score],["Education",match.education_score]].map(([l,s]) => (
+            <div key={l} style={{ background:"#0F1E3A", borderRadius:8, padding:"7px 4px" }}>
+              <div style={{ fontFamily:"'DM Mono'", fontSize:16, fontWeight:500, color:scoreCol(s) }}>{s}</div>
+              <div style={{ fontSize:10, color:"#3D5280", marginTop:1 }}>{l}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+      <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:3, marginBottom:14, background:"#0C1425", borderRadius:9, padding:3 }}>
+        {["overview","gaps","courses"].map(t => (
+          <button key={t} className="tab-btn" onClick={() => setTab(t)}
+            style={{ background:tab===t?"#1A2D50":"transparent", border:"none", color:tab===t?"#E2E8F4":"#3D5280", borderRadius:7, padding:"6px 3px", cursor:"pointer", fontSize:10, fontWeight:700, fontFamily:"'Syne'", letterSpacing:".08em", textTransform:"uppercase" }}>
+            {t}
+          </button>
+        ))}
+      </div>
+
+      {tab==="overview" && (
+        <div>
+          <div style={{ background:"rgba(0,201,167,.07)", border:"1px solid rgba(0,201,167,.2)", borderRadius:10, padding:"11px 13px", marginBottom:13 }}>
+            <div style={{ fontSize:9, color:"#00C9A7", fontWeight:700, letterSpacing:".1em", marginBottom:6 }}>AI RECOMMENDATION</div>
+            <p style={{ fontSize:12, color:"#B0BFDA", lineHeight:1.75 }}>{match.recommendation}</p>
+          </div>
+          {match.strengths?.length>0 && (
+            <div style={{marginBottom:13}}>
+              <div style={{ fontSize:9, color:"#22C55E", fontWeight:700, letterSpacing:".1em", marginBottom:8 }}>STRENGTHS</div>
+              {match.strengths.map((s,i) => (
+                <div key={i} style={{ display:"flex", gap:7, marginBottom:6 }}>
+                  <div style={{ width:4, height:4, borderRadius:"50%", background:"#22C55E", marginTop:5, flexShrink:0 }}/>
+                  <span style={{ fontSize:12, color:"#B0BFDA", lineHeight:1.6 }}>{s}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          {match.matching_skills?.length>0 && (
+            <div>
+              <div style={{ fontSize:9, color:"#7B90BB", fontWeight:700, letterSpacing:".1em", marginBottom:8 }}>MATCHING SKILLS</div>
+              <div style={{ display:"flex", flexWrap:"wrap", gap:5 }}>
+                {match.matching_skills.map((sk,i) => (
+                  <span key={i} style={{ background:"rgba(34,197,94,.08)", color:"#22C55E", borderRadius:6, padding:"3px 9px", fontSize:11, border:"1px solid rgba(34,197,94,.2)" }}>{sk}</span>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {tab==="gaps" && (
+        <div>
+          {match.missing_required_skills?.length>0 && (
+            <div style={{marginBottom:13}}>
+              <div style={{ fontSize:9, color:"#EF4444", fontWeight:700, letterSpacing:".1em", marginBottom:8 }}>MISSING — REQUIRED</div>
+              <div style={{ display:"flex", flexWrap:"wrap", gap:5 }}>
+                {match.missing_required_skills.map((sk,i) => (
+                  <span key={i} style={{ background:"rgba(239,68,68,.08)", color:"#EF4444", borderRadius:6, padding:"3px 9px", fontSize:11, border:"1px solid rgba(239,68,68,.2)" }}>{sk}</span>
+                ))}
+              </div>
+            </div>
+          )}
+          {match.missing_preferred_skills?.length>0 && (
+            <div style={{marginBottom:13}}>
+              <div style={{ fontSize:9, color:"#F59E0B", fontWeight:700, letterSpacing:".1em", marginBottom:8 }}>MISSING — PREFERRED</div>
+              <div style={{ display:"flex", flexWrap:"wrap", gap:5 }}>
+                {match.missing_preferred_skills.map((sk,i) => (
+                  <span key={i} style={{ background:"rgba(245,158,11,.08)", color:"#F59E0B", borderRadius:6, padding:"3px 9px", fontSize:11, border:"1px solid rgba(245,158,11,.2)" }}>{sk}</span>
+                ))}
+              </div>
+            </div>
+          )}
+          {match.gap_analysis?.length>0 && (
+            <div>
+              <div style={{ fontSize:9, color:"#7B90BB", fontWeight:700, letterSpacing:".1em", marginBottom:8 }}>GAP ANALYSIS</div>
+              {match.gap_analysis.map((g,i) => (
+                <div key={i} style={{ background:"#0C1425", border:"1px solid #1A2D50", borderRadius:9, padding:"9px 11px", marginBottom:7, display:"flex", justifyContent:"space-between", gap:9, alignItems:"flex-start" }}>
+                  <span style={{ fontSize:12, color:"#B0BFDA", lineHeight:1.6 }}>{g.gap}</span>
+                  <span style={{ fontSize:9, fontWeight:700, padding:"2px 6px", borderRadius:4, flexShrink:0, whiteSpace:"nowrap", background:g.importance==="Critical"?"rgba(239,68,68,.15)":g.importance==="Important"?"rgba(245,158,11,.15)":"rgba(123,144,187,.12)", color:g.importance==="Critical"?"#EF4444":g.importance==="Important"?"#F59E0B":"#7B90BB" }}>
+                    {g.importance}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+          {!match.missing_required_skills?.length && !match.gap_analysis?.length && (
+            <div style={{ textAlign:"center", padding:"32px 0", color:"#22C55E" }}>
+              <div style={{ margin:"0 auto 8px", display:"flex", justifyContent:"center" }}><Icon.Check /></div>
+              <div style={{ fontWeight:600, fontSize:14 }}>No critical gaps!</div>
+              <div style={{ fontSize:12, color:"#7B90BB", marginTop:4 }}>Candidate meets all core requirements.</div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {tab==="courses" && (
+        <div>
+          {match.course_suggestions?.length>0 ? (
+            <>
+              <p style={{ fontSize:12, color:"#7B90BB", marginBottom:13, lineHeight:1.75 }}>Personalized learning path to bridge skill gaps for this role:</p>
+              {match.course_suggestions.map((c,i) => (
+                <div key={i} style={{ background:"#0C1425", border:"1px solid #1A2D50", borderRadius:11, padding:"11px 13px", marginBottom:9 }}>
+                  <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:6 }}>
+                    <span style={{ fontSize:9, fontWeight:700, color:"#C084FC", letterSpacing:".08em" }}>{(c.skill||"").toUpperCase()}</span>
+                    <span style={{ fontSize:9, fontWeight:700, padding:"2px 6px", borderRadius:4, whiteSpace:"nowrap", background:c.priority==="High"?"rgba(239,68,68,.15)":c.priority==="Medium"?"rgba(245,158,11,.15)":"rgba(123,144,187,.12)", color:c.priority==="High"?"#EF4444":c.priority==="Medium"?"#F59E0B":"#7B90BB" }}>
+                      {c.priority} priority
+                    </span>
+                  </div>
+                  <div style={{ fontSize:13, fontWeight:600, color:"#E2E8F4", marginBottom:8, lineHeight:1.4 }}>{c.course}</div>
+                  <div style={{ display:"flex", gap:12, flexWrap:"wrap" }}>
+                    <div style={{ display:"flex", gap:4, alignItems:"center" }}>
+                      <Icon.Book /><span style={{ fontSize:11, color:"#00C9A7" }}>{c.platform}</span>
+                    </div>
+                    {c.duration && (
+                      <div style={{ display:"flex", gap:4, alignItems:"center" }}>
+                        <Icon.Clock /><span style={{ fontSize:11, fontFamily:"'DM Mono'", color:"#7B90BB" }}>{c.duration}</span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </>
+          ) : (
+            <div style={{ textAlign:"center", padding:"32px 0", color:"#22C55E" }}>
+              <div style={{ margin:"0 auto 8px", display:"flex", justifyContent:"center" }}><Icon.Award /></div>
+              <div style={{ fontWeight:600, fontSize:14 }}>No courses needed!</div>
+              <div style={{ fontSize:12, color:"#7B90BB", marginTop:4 }}>Candidate is fully qualified for this role.</div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Root App ─────────────────────────────────────────────────────────────────
+function App() {
+  const [apiKey, setApiKey] = useState("");
+  const [step, setStep] = useState("apikey");
+  const [resumeFiles, setResumeFiles] = useState([]);
+  const [jdFiles, setJDFiles] = useState([]);
+  const [result, setResult] = useState({ resumes:[], jds:[], matches:{} });
+  const [log, setLog] = useState([]);
+  const [progress, setProgress] = useState(0);
+  const [statusMsg, setStatusMsg] = useState("");
+  const [selected, setSelected] = useState(null);
+
+  const addLog = (msg, type="info") =>
+    setLog(prev => [...prev, { msg, type, t: new Date().toLocaleTimeString("en",{hour12:false}) }]);
+
+  const startProcessing = async () => {
+    setStep("processing"); setLog([]); setProgress(0);
+    const total = resumeFiles.length + jdFiles.length + resumeFiles.length;
+    let done = 0;
+    const tick = msg => { done++; setProgress(Math.round((done/total)*100)); setStatusMsg(msg); };
+    try {
+      addLog("Extracting text from uploaded files…","section");
+      const rData=[], jData=[];
+      for (const f of resumeFiles) {
+        addLog(`Reading ${f.name}`);
+        try { const text=await extractText(f); rData.push({file:f,text}); addLog(`  ✓ ${f.name} (${text.length.toLocaleString()} chars)`,"ok"); }
+        catch(e) { addLog(`  ✗ ${f.name}: ${e.message}`,"err"); rData.push({file:f,text:""}); }
+      }
+      for (const f of jdFiles) {
+        addLog(`Reading ${f.name}`);
+        try { const text=await extractText(f); jData.push({file:f,text}); addLog(`  ✓ ${f.name}`,"ok"); }
+        catch(e) { addLog(`  ✗ ${f.name}: ${e.message}`,"err"); jData.push({file:f,text:""}); }
+      }
+      addLog("AI analyzing candidate profiles…","section");
+      const aResumes=[];
+      for (const r of rData) {
+        addLog(`Analyzing ${r.file.name}`);
+        try {
+          const analysis=await analyzeResume(apiKey,r.text);
+          aResumes.push({...r,analysis});
+          addLog(`  ✓ ${analysis.name} · ${analysis.title}`,"ok");
+          tick(`Analyzed: ${analysis.name}`);
+        } catch(e) {
+          addLog(`  ✗ ${e.message}`,"err");
+          aResumes.push({...r,analysis:{name:r.file.name.replace(/\.[^.]+$/,""),title:"Unknown",experience_years:0,skills:[],education:"",certifications:[],industries:[],summary:""}});
+          tick(`Skipped: ${r.file.name}`);
+        }
+        await sleep(300);
+      }
+      addLog("AI analyzing job descriptions…","section");
+      const aJDs=[];
+      for (const j of jData) {
+        addLog(`Analyzing ${j.file.name}`);
+        try {
+          const analysis=await analyzeJD(apiKey,j.text);
+          aJDs.push({...j,analysis});
+          addLog(`  ✓ ${analysis.title} · ${analysis.industry}`,"ok");
+          tick(`Analyzed JD: ${analysis.title}`);
+        } catch(e) {
+          addLog(`  ✗ ${e.message}`,"err");
+          aJDs.push({...j,analysis:{title:j.file.name.replace(/\.[^.]+$/,""),required_skills:[],preferred_skills:[],experience_required:0,education_required:"",certifications_preferred:[],industry:"",summary:""}});
+          tick(`Skipped: ${j.file.name}`);
+        }
+        await sleep(300);
+      }
+      addLog("AI matching candidates → job descriptions…","section");
+      const allMatches={};
+      const jdAnalyses=aJDs.map(j=>j.analysis);
+      for (let i=0;i<aResumes.length;i++) {
+        const r=aResumes[i];
+        addLog(`Matching ${r.analysis.name}`);
+        try {
+          const res=await matchResumeToAllJDs(apiKey,r.analysis,jdAnalyses);
+          allMatches[i]=Array.isArray(res)?res:[];
+          const best=allMatches[i].reduce((a,b)=>a.overall_score>b.overall_score?a:b,{overall_score:0});
+          addLog(`  ✓ Best: ${best.overall_score}% — ${best.verdict}`,"ok");
+          tick(`Matched: ${r.analysis.name}`);
+        } catch(e) {
+          addLog(`  ✗ ${e.message}`,"err");
+          allMatches[i]=jdAnalyses.map((_,ji)=>({jd_index:ji,overall_score:0,skills_score:0,experience_score:0,education_score:0,verdict:"Needs Development",matching_skills:[],missing_required_skills:[],missing_preferred_skills:[],strengths:[],gap_analysis:[],course_suggestions:[],recommendation:"Analysis failed."}));
+          tick(`Skipped: ${r.analysis.name}`);
+        }
+        await sleep(300);
+      }
+      setResult({resumes:aResumes,jds:aJDs,matches:allMatches});
+      addLog("All done! Building dashboard…","ok");
+      await sleep(700);
+      setStep("dashboard");
+    } catch(e) { addLog(`Fatal error: ${e.message}`,"err"); }
+  };
+
+  const exportCSV = () => {
+    const { resumes, jds, matches } = result;
+    const hdr=["Candidate","Resume File","JD Title","JD File","Overall Score","Skills Score","Experience Score","Education Score","Verdict","Matching Skills","Missing Required","Missing Preferred","Top Courses","Recommendation"];
+    const rows=[hdr];
+    resumes.forEach((r,ri) => {
+      (matches[ri]||[]).forEach(m => {
+        const jd=jds[m.jd_index];
+        rows.push([r.analysis.name,r.file.name,jd?.analysis?.title||"",jd?.file?.name||"",m.overall_score,m.skills_score,m.experience_score,m.education_score,m.verdict,(m.matching_skills||[]).join("; "),(m.missing_required_skills||[]).join("; "),(m.missing_preferred_skills||[]).join("; "),(m.course_suggestions||[]).slice(0,3).map(c=>`${c.course} (${c.platform})`).join("; "),m.recommendation||""]);
+      });
+    });
+    const csv=rows.map(r=>r.map(c=>`"${String(c??"").replace(/"/g,'""')}"`).join(",")).join("\n");
+    const url=URL.createObjectURL(new Blob([csv],{type:"text/csv"}));
+    const a=document.createElement("a");
+    a.href=url; a.download=`talent-match-${new Date().toISOString().slice(0,10)}.csv`;
+    a.click(); URL.revokeObjectURL(url);
+  };
+
+  if (step==="apikey") return <ApiKeyScreen onSubmit={k => { setApiKey(k); setStep("upload"); }} />;
+  if (step==="upload") return <UploadStep rFiles={resumeFiles} setRFiles={setResumeFiles} jFiles={jdFiles} setJFiles={setJDFiles} onStart={startProcessing} onBack={() => setStep("apikey")} />;
+  if (step==="processing") return <ProcessingStep log={log} progress={progress} status={statusMsg} />;
+  if (step==="dashboard") return <Dashboard result={result} selected={selected} setSelected={setSelected} onExport={exportCSV} onReset={() => { setStep("upload"); setResumeFiles([]); setJDFiles([]); setResult({resumes:[],jds:[],matches:{}}); }} />;
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
